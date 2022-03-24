@@ -1,0 +1,50 @@
+!pip install berserk
+import pandas as pd
+import berserk
+import time
+
+df=pd.read_csv("//content/drive/MyDrive/Chess_databse.csv")
+
+session = berserk.TokenSession('A VALID LICHESS AUTHENTICATION TOKEN')
+client = berserk.Client(session=session)
+
+players=list(set(pd.read_csv("/content/drive/MyDrive/lichess_db_standard_rated_2014-01_game_info.csv")['white'].to_list()))
+count=1
+for pname in players:
+  if pname not in df['Name']:
+    print(pname)
+    try:
+      games=list(client.games.export_by_player(pname,perf_type='rapid',analysed=True,max=100))
+      time.sleep(2)
+    except:
+      continue
+    for x in range(len(games)):
+      print(x)
+      try:
+        game_id = games[x]['id']
+        if x%30==0:
+          time.sleep(3)
+        cgame=client.games.export(game_id)
+        if cgame['players']['white']['user']['name'] == pname:
+          colour='white'
+        else:
+          colour='black'
+          acpl=cgame['players'][colour]['analysis']['acpl']
+          blunder=cgame['players'][colour]['analysis']['blunder']
+          inaccuracy=cgame['players'][colour]['analysis']['inaccuracy']
+          mistake=cgame['players'][colour]['analysis']['mistake']
+          ply=cgame['opening']['ply']
+          stats=cgame['status']
+          rating=cgame['players'][colour]['rating']
+          moves=cgame['moves'].count(' ')+1
+          eco=cgame['opening']['eco']
+          toadd={'Percentage of Inaccuracies':(inaccuracy/moves)*100,'Percentage of Blunders':(blunder/moves)*100,'Percentage of Mistakes':(mistake/moves)*100,
+                  'Centi-pawn Loss':acpl,'Opening Ply':ply,'Finished By':stats,'Rating':rating,'Name':pname,'Eco':eco}
+          df=df.append(toadd,ignore_index=True)
+      except:
+        continue
+    count+=1
+    if count%20==0:
+      df.to_csv(f"Chessdata_{count}.csv")
+  else:
+    continue
