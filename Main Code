@@ -1,0 +1,227 @@
+!pip install berserk
+
+## Importing all modules we may need in this project
+import pandas as pd
+import seaborn as sns
+import numpy as np
+from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import RepeatedKFold
+import matplotlib.pyplot as plt
+import berserk
+import math
+import time
+import statsmodels.api as sm
+import statsmodels.tools 
+from sklearn.model_selection import train_test_split 
+from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.neighbors import NearestNeighbors
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import MinMaxScaler
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from sklearn.model_selection import  GridSearchCV
+import warnings
+warnings.filterwarnings("ignore")
+
+## Using this VIF calculator to detect covariance
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+def calculate_vif(X, thresh=5.0):
+    variables = list(range(X.shape[1]))
+    dropped = True
+    while dropped:
+        dropped = False
+        vif = [variance_inflation_factor(X.iloc[:, variables].values, ix)
+               for ix in range(X.iloc[:, variables].shape[1])]
+
+        maxloc = vif.index(max(vif))
+        if max(vif) > thresh:
+            print('dropping \'' + X.iloc[:, variables].columns[maxloc] +
+                  '\' at index: ' + str(maxloc))
+            del variables[maxloc]
+            dropped = True
+
+    print('Remaining variables:')
+    print(X.columns[variables])
+    return X.iloc[:, variables]
+
+## Reading in our data of chess games from Lichess.org
+df=pd.read_csv("//content/drive/MyDrive/Chess_games.csv")
+
+df.drop(columns=['Unnamed: 0'],inplace=True)
+
+df.head()
+
+## As using several scrapers may have resulted in duplicates, we drop these
+df.drop_duplicates(inplace=True)
+
+## Checking how many games we have left
+len(df)
+
+## Dropping players who have less than 5 games played, to make the model more robust
+to_drop=[]
+too_drop=[]
+for name in df['Name'].unique():
+  if df[df['Name']==name].count()[2]<5:
+    playmore=df[df['Name']==name].index.to_list()
+    to_drop.append(playmore)
+for x in to_drop:
+  for y in x:
+    too_drop.append(y)
+df.drop(too_drop,inplace=True)
+
+## Seeing how many individual players we have left
+df.Name.nunique()
+
+## Making a database of aggregated information by username
+users = (df.groupby('Name', as_index=False)
+        .agg({'Rating':'median','Opening Ply':'median','Centi-pawn Loss':'median','Percentage of Inaccuracies':'median','Percentage of Mistakes':'median','Percentage of Blunders':'median', 'Eco': lambda x: x.value_counts().index[0], 'Finished By': lambda x: x.value_counts().index[0]}))
+
+## Taking a look at the users table, from lowest rating to highest
+users.sort_values('Rating')
+
+## Dummying Eco and how games finished for the purpose of modelling
+users=pd.get_dummies(users,columns=['Eco'],prefix='Eco')
+users=pd.get_dummies(users,columns=['Finished By'],prefix='Finish')
+
+## Creating a list of all different openings we have in our dataframe
+users.columns.to_list()
+eco_cols=[]
+for col in users.columns.to_list():
+  if col.startswith('Eco'):
+    eco_cols.append(col)
+
+## We don't use openings played by less than 20 users in the model, as these openings don't have enough data to reliably model
+for x in eco_cols:
+  if users[x].sum()<20:
+    users.drop(columns=[x],inplace=True)
+
+## We check for which variables have a higher covariance
+feature_cols=users.columns.to_list()
+feature_cols.remove('Rating')
+feature_cols.remove('Name')
+X=users[feature_cols]
+calculate_vif(X)
+
+## Here we choose our feature columns, we have removed some due to the VIF (but not all)
+feature_cols=users.columns.to_list()
+feature_cols.remove('Rating')
+feature_cols.remove('Name')
+feature_cols.remove('Centi-pawn Loss')
+feature_cols.remove('Finish_resign')
+X=users[feature_cols]
+feature_cols.append('const')
+y=users['Rating']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.2, random_state = 3)
+
+## Adding a constant
+X_train=sm.add_constant(X_train)
+X_test=sm.add_constant(X_test)
+
+## Using statsmodels to create a Linear Regression model
+lin_reg = sm.OLS(y_train, X_train)
+results = lin_reg.fit()
+results.summary()
+
+## Having a look at RMSE for train and test
+X_train['pred'] = results.predict(X_train)
+rmse = statsmodels.tools.eval_measures.rmse(y_train, X_train['pred'])
+print(rmse)
+X_test['pred'] = results.predict(X_test)
+rmse = statsmodels.tools.eval_measures.rmse(y_test, X_test['pred'])
+print(rmse)
+
+## Looking at what kind of values we are predicting. As you can see the predictions are more static than I would like,
+## with the minimum still being over 1000
+X_train['pred'].describe()
+
+X_train.drop(columns=['pred'],inplace=True)
+X_test.drop(columns=['pred'],inplace=True)
+
+## Getting just eco codes (and random ends of column names, but these won't matter as you will see later)
+ecos=[]
+for x in users.columns:
+  ecos.append(x[4:]) 
+ecos
+
+## Creating a basic nearest neighbor model with the nearest neighbor being 1. This is to experiment with finding an opponent.
+neigh = NearestNeighbors(n_neighbors=1)
+neigh.fit(users[['Opening Ply','Centi-pawn Loss','Percentage of Inaccuracies','Percentage of Mistakes','Percentage of Blunders']])
+
+users.drop(columns=['Finish_resign'],inplace=True)
+
+session = berserk.TokenSession('A VALID LICHESS AUTHENTICATION')
+client = berserk.Client(session=session)
+
+## The final function, which predicts your ELO and finds an opponent given a Lichess username
+def find_an_opponent(somebody):
+  # Using the creative way we experimented with earlier to get ECO codes
+  ecos=[]
+  for x in users.columns:
+    ecos.append(x[4:]) 
+  # Creating a blank dataframe to store results in
+  freshdf=df[0:0]
+  guesserdf=users[0:0]
+  print('Analysing your games...')
+  # We export all the players rapid games which have been analysed
+  games=list(client.games.export_by_player(somebody,perf_type='rapid',analysed=True))
+  time.sleep(2)
+  # For each game
+  for x in range(len(games)):
+    try:
+      game_id = games[x]['id']
+      # These 3 second pauses are to stop Lichess kicking out the scraper
+      if x%30==0:
+        time.sleep(3)
+      cgame=client.games.export(game_id)
+      # Find if the player was the white or black player
+      if cgame['players']['white']['user']['name'] == somebody:
+        colour='white'
+      else:
+        colour='black'
+      # Extract all the data we use to model
+      acpl=cgame['players'][colour]['analysis']['acpl']
+      blunder=cgame['players'][colour]['analysis']['blunder']
+      inaccuracy=cgame['players'][colour]['analysis']['inaccuracy']
+      mistake=cgame['players'][colour]['analysis']['mistake']
+      ply=cgame['opening']['ply']
+      stats=cgame['status']
+      rating=cgame['players'][colour]['rating']
+      moves=cgame['moves'].count(' ')+1
+      eco=cgame['opening']['eco']
+      # Storing the data in a dictionary so it can be appended to our blank dataframe
+      toadd={'Percentage of Inaccuracies':(inaccuracy/moves)*100,'Percentage of Blunders':(blunder/moves)*100,'Percentage of Mistakes':(mistake/moves)*100,
+              'Centi-pawn Loss':acpl,'Opening Ply':ply,'Finished By':stats,'Rating':rating,'Name':somebody,'Eco':eco}
+      # We then add the data from that game onto a "freshdf"
+      freshdf=freshdf.append(toadd,ignore_index=True)
+    except:
+      continue
+  # After going through all of the players games, we take the aggregates in the same way we got them for the users dataframe
+  freshdf=freshdf.groupby('Name', as_index=False).agg({'Opening Ply':'median','Centi-pawn Loss':'median','Percentage of Inaccuracies':'median','Percentage of Mistakes':'median','Percentage of Blunders':'median', 'Eco': lambda x: x.value_counts().index[0], 'Finished By': lambda x: x.value_counts().index[0]})
+  Eco=freshdf['Eco']
+  Finisher=freshdf['Finished By']
+  # We not input all this data into a dataframe called "guesserdf" which will be used for modelling
+  guesserdf.at[0,'Name']=somebody
+  guesserdf.at[0,'Opening Ply']=freshdf.iloc[0]['Opening Ply']
+  guesserdf.at[0,'Centi-pawn Loss']=freshdf.iloc[0]['Centi-pawn Loss']
+  guesserdf.at[0,'Percentage of Inaccuracies']=freshdf.iloc[0]['Percentage of Inaccuracies']
+  guesserdf.at[0,'Percentage of Mistakes']=freshdf.iloc[0]['Percentage of Mistakes']
+  guesserdf.at[0,'Percentage of Blunders']=freshdf.iloc[0]['Percentage of Blunders']
+  if freshdf.iloc[0]['Eco'] in ecos:
+    guesserdf.at[0,f'Eco_{Eco}']=1
+  if freshdf.iloc[0]['Finished By']!='resign':
+    guesserdf.at[0,f'Finish_{Finisher}']=1
+  # We fill nulls with 0 as we have a few dummy variables
+  guesserdf.fillna(0,inplace=True)
+  guesserdf['const']=1
+  guesserdf=guesserdf[X_train.columns.to_list()]
+  # Here we predict ELO and find a suitable opponent using clustering
+  ELO=results.predict(guesserdf)[0]
+  Opplocation=neigh.kneighbors(freshdf[['Opening Ply','Centi-pawn Loss','Percentage of Inaccuracies','Percentage of Mistakes','Percentage of Blunders']])[1][0][0]
+  # We find the opponent's name and ELO
+  Opponent=users.reset_index().iloc[Opplocation]['Name']
+  OppELO=users.iloc[Opplocation]['Rating']
+  # This information is then displayed
+  return f'Your predicted rating is {int(ELO)}. A suitable opponent for you would be {Opponent}, who has a rating of {int(OppELO)}'
+find_an_opponent('rexolya')
